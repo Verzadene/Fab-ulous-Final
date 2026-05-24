@@ -1,0 +1,20 @@
+# ── Credentials & local config ──────────────────────────────────────────────
+config.local.php
+post/config.php
+ 
+# ── User-generated uploads ───────────────────────────────────────────────────
+uploads/commissions/*
+uploads/posts/*
+uploads/messages/*
+uploads/profile_pics/*
+ 
+# ── OS / editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+ 
+# ── PHP environment ───────────────────────────────────────────────────────────
+.env
+*.env
