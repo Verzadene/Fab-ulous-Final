@@ -1,0 +1,217 @@
+<?php
+session_start();
+require_once __DIR__ . '/../config.php';
+
+if (!empty($_SESSION['user']) && !empty($_SESSION['mfa_verified'])) {
+    header('Location: ' . dashboard_path_for_role($_SESSION['user']['role'] ?? 'user'));
+    exit;
+}
+
+$sent    = isset($_GET['sent']);
+$error   = '';
+$success = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action   = $_POST['action'] ?? '';
+    $email    = strtolower(trim($_POST['email'] ?? ''));
+    $code     = trim($_POST['reset_code'] ?? '');
+    $newPass  = $_POST['new_password'] ?? '';
+    $confirm  = $_POST['confirm_password'] ?? '';
+
+    if ($action === 'reset') {
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = 'Please enter a valid email address.';
+        } elseif (strlen($code) !== 6 || !ctype_digit($code)) {
+            $error = 'Enter the 6-digit code from your email.';
+        } elseif (strlen($newPass) < 8 || preg_match_all('/[^a-zA-Z0-9]/', $newPass) < 1 || preg_match_all('/[0-9]/', $newPass) < 1) {
+            $error = 'Password must be 8+ chars with at least 1 special char and 1 number.';
+        } elseif ($newPass !== $confirm) {
+            $error = 'Passwords do not match.';
+        } else {
+            $connPasswordResets = db_connect('password_resets');
+            $tableExists = (bool) $connPasswordResets->query("SHOW TABLES LIKE 'password_resets'")->num_rows;
+            if (!$tableExists) {
+                $error = 'Password reset is not available yet. Run database/migration_v5.sql first.';
+            }
+
+            $connAccounts = db_connect('accounts');
+            $accountStmt = $connAccounts->prepare("SELECT id FROM accounts WHERE email = ? LIMIT 1");
+            $accountStmt->bind_param('s', $email);
+            $accountStmt->execute();
+            $account = $accountStmt->get_result()->fetch_assoc();
+            $accountStmt->close();
+
+            if (!$account) {
+                $error = 'No FABulous account exists for that email address.';
+            }
+        }
+
+        if (!$error) {
+            // Fetch the reset row without a server-side time comparison so the
+            // expiry check can be performed in PHP via time(), bypassing the
+            // MySQL server clock which may desync from PHP on shared hosting.
+            $tokenStmt = $connPasswordResets->prepare(
+                "SELECT id, created_at FROM password_resets
+                 WHERE email = ? AND reset_code = ? AND used = 0
+                 LIMIT 1"
+            );
+            $tokenStmt->bind_param('ss', $email, $code);
+            $tokenStmt->execute();
+            $tokenRow = $tokenStmt->get_result()->fetch_assoc();
+            $tokenStmt->close();
+
+            // created_at is a TIMESTAMP column; mysqli returns it as a datetime
+            // string. strtotime() converts it using PHP's Asia/Manila timezone
+            // (set in config.php), so expiry is checked entirely in PHP —
+            // the MySQL server clock is never consulted.
+            $tokenExpired = false;
+            if ($tokenRow) {
+                $createdTs = strtotime((string) $tokenRow['created_at']);
+                if ((time() - $createdTs) > 600) { // 10-minute window
+                    $tokenExpired = true;
+                }
+            }
+
+            if (!$tokenRow || $tokenExpired) {
+                // Audit the expired / invalid attempt if we can identify the user.
+                if ($tokenExpired && $account) {
+                    try {
+                        $connAudit = db_connect('audit_log');
+                        $expStmt = $connAudit->prepare(
+                            "INSERT INTO audit_log
+                                (admin_id, admin_username, action, target_type, target_id, visibility_role)
+                             VALUES
+                                (?, ?, 'Expired Password Reset Attempt', 'account', ?, 'admin')"
+                        );
+                        if ($expStmt) {
+                            $auditId  = (int) $account['id'];
+                            $auditUsr = (string) ($account['username'] ?? $email);
+                            $expStmt->bind_param('isi', $auditId, $auditUsr, $auditId);
+                            $expStmt->execute();
+                            $expStmt->close();
+                        }
+                    } catch (Throwable $e) {
+                        error_log('FABulous audit reset-expired error: ' . $e->getMessage());
+                    }
+                }
+                $error = 'That code is incorrect or has expired. Request a new one.';
+            } else {
+                $hash = password_hash($newPass, PASSWORD_DEFAULT);
+
+                $updStmt = $connAccounts->prepare("UPDATE accounts SET password = ? WHERE id = ?");
+                $updStmt->bind_param('si', $hash, $account['id']);
+                $updStmt->execute();
+                $updStmt->close();
+
+                $markStmt = $connPasswordResets->prepare("UPDATE password_resets SET used = 1 WHERE id = ?");
+                $markStmt->bind_param('i', $tokenRow['id']);
+                $markStmt->execute();
+                $markStmt->close();
+
+                unset($_SESSION['reset_email']);
+                header('Location: login.php?reset=1');
+                exit;
+            }
+        }
+    }
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FABulous – Reset Password</title>
+  <link rel="icon" type="image/png" href="../images/Top_Left_Nav_Logo.png" />
+  <link rel="shortcut icon" type="image/png" href="../images/Top_Left_Nav_Logo.png" />
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:wght@400;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="login.css"/>
+</head>
+<body>
+
+  <nav class="topnav">
+    <img src="../images/Top_Left_Nav_Logo.png" alt="FABulous Logo" class="nav-logo"/>
+  </nav>
+
+  <div class="page-controls">
+    <a href="forgot_password.php" class="ctrl-btn return-btn">&#8592; Back</a>
+  </div>
+
+  <main class="card-container">
+    <div class="left-panel">
+      <img src="../images/Big Logo.png" alt="FABulous Logo" class="brand-logo-img"/>
+      <h1 class="brand-heading">Create a<br/>New Password</h1>
+      <p class="brand-desc">
+        Enter the 6-digit code we emailed you, then choose a new password.
+        Your account data stays intact.
+      </p>
+      <div class="carousel-dots">
+        <span class="dot active"></span><span class="dot active"></span><span class="dot active"></span>
+      </div>
+    </div>
+
+    <div class="right-panel">
+      <h2 class="panel-title">Reset Password</h2>
+
+      <?php if ($sent): ?>
+        <p class="success-msg">Reset code sent! Check your inbox (and spam folder).</p>
+      <?php endif; ?>
+
+      <?php if ($error): ?>
+        <p class="error-msg"><?php echo htmlspecialchars($error); ?></p>
+      <?php endif; ?>
+
+      <form method="POST" action="" class="auth-form auth-form--spacious">
+        <input type="hidden" name="action" value="reset"/>
+        <div class="input-group">
+          <input type="email" name="email" class="input-field"
+                 placeholder="Registered email address"
+                 value="<?php echo htmlspecialchars($_SESSION['reset_email'] ?? ''); ?>"
+                 autocomplete="email" required/>
+        </div>
+        <div class="input-group">
+          <input type="text" name="reset_code" class="input-field"
+                 placeholder="6-digit reset code"
+                 inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+                 autocomplete="one-time-code" required/>
+        </div>
+        <div class="input-group">
+          <input type="password" name="new_password" id="newPass" class="input-field"
+                 placeholder="New password (min 8 chars)"
+                 autocomplete="new-password" required/>
+        </div>
+        <div class="input-group">
+          <input type="password" name="confirm_password" id="confirmPass" class="input-field"
+                 placeholder="Confirm new password"
+                 autocomplete="new-password" required/>
+        </div>
+        <div class="show-password-row">
+          <label class="checkbox-label">
+            <input type="checkbox" id="showPass" onchange="togglePasswords()"/>
+            <span class="custom-checkbox"></span>
+            Show Passwords
+          </label>
+        </div>
+        <button type="submit" class="btn-primary">Set New Password</button>
+      </form>
+
+      <div class="bottom-links">
+        <span class="bottom-text">Need a new code?
+          <a href="forgot_password.php" class="link-btn">Request one</a>
+        </span>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    function togglePasswords() {
+      const type = document.getElementById('showPass').checked ? 'text' : 'password';
+      document.getElementById('newPass').type = type;
+      document.getElementById('confirmPass').type = type;
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
